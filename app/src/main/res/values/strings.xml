@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">和尚</string>
+    <string name="xposed_desc">看门狗巡检、进程保活和无障碍守护</string>
+    <string-array name="xposed_scope">
+        <item>android</item>
+        <item>com.hakuzero.heshang</item>
+    </string-array>
+</resources>

@@ -172,6 +172,12 @@ internal object Watchdog {
             val enabled = config.apps.filter { it.enabled }
             val alive = enabled.map { it.packageName }.filter { isPackageAlive(names, it) }.toSet()
             val daemonPid = daemonPid(rows)
+            val table = ServiceTable.read(ams)
+            val runningServices = if (table.trusted) {
+                table.services.map { "${it.packageName}/${it.className}" }.toSet()
+            } else {
+                null
+            }
             val decision = PatrolPolicy.decide(
                 com.minedie.keepalive.core.PatrolInput(
                     masterEnabled = config.master,
@@ -183,6 +189,7 @@ internal object Watchdog {
                     memory = memory,
                     guardedA11y = config.a11y,
                     enabledA11yRaw = if (bootReady && config.master) readA11y(context) else "",
+                    runningServices = runningServices,
                 ),
             )
             memory = decision.memory
@@ -199,12 +206,21 @@ internal object Watchdog {
                     decision.a11yAdded.forEach { events += EventText.a11yFail(it) }
                 }
             }
+            val packageFailureNoted = mutableSetOf<String>()
             for (app in decision.startComponents) {
                 val reason = startComponent(context, app.component)
                 if (reason == null) continue
-                val (next, event) = PatrolPolicy.noteImmediateFailure(memory, app, reason = reason)
-                memory = next
-                if (event != null) events += event
+                val processLevel = memory[app.packageName]?.awaitingResult == true
+                val (afterService, serviceEvent) = PatrolPolicy.noteServiceFailure(memory, app, reason = reason)
+                memory = afterService
+                if (processLevel && app.packageName !in packageFailureNoted) {
+                    packageFailureNoted += app.packageName
+                    val (next, event) = PatrolPolicy.noteImmediateFailure(memory, app, reason = reason)
+                    memory = next
+                    if (event != null) events += event
+                } else if (serviceEvent != null) {
+                    events += serviceEvent
+                }
             }
             while (true) {
                 val extra = pendingEvents.poll() ?: break
@@ -223,7 +239,7 @@ internal object Watchdog {
                 stop = decision.stopDaemon,
                 gaveUpPackages = memory.filter { (pkg, item) -> item.gaveUp && pkg in enabledPackages }.keys.toList(),
                 runningServices = com.minedie.keepalive.config.ConfigCodec.servicesToJson(
-                    ServiceTable.read(ams).map { Triple(it.packageName, it.className, it.processName) },
+                    table.services.map { Triple(it.packageName, it.className, it.processName) },
                 ),
             )
             deliver(context, config, report)
@@ -235,7 +251,7 @@ internal object Watchdog {
     }
 
     private fun syncComponents(apps: List<GuardedApp>) {
-        val next = apps.filter { it.enabled }.associate { it.packageName to it.component }
+        val next = apps.filter { it.enabled }.associate { it.packageName to it.targets().joinToString("\n") }
         for ((pkg, component) in next) {
             if (!PatrolPolicy.armStart(components[pkg], component)) continue
             val current = memory[pkg] ?: AppMemory()
@@ -278,23 +294,32 @@ internal object Watchdog {
     }
 
     private fun deliver(context: Context, config: LoadedConfig, report: Report) {
+        // ColorOS freezes the app uid, including :daemon. The provider call runs from
+        // system_server and is what actually gets the event log written while frozen.
+        val wrote = writeReport(context, report)
         val useDaemon = (config.master && report.phase != Phase.WAITING_BOOT) || report.stop
-        if (!useDaemon) {
-            try {
-                context.contentResolver.call(CONFIG_AUTHORITY, "report", null, report.toBundle())
-            } catch (error: Throwable) {
-                KLog.i("provider report failed: ${error.javaClass.simpleName}")
-            }
-            return
-        }
+        if (!useDaemon) return
         val intent = Intent().setClassName(APP_PACKAGE, DAEMON_CLASS)
-        intent.putExtra("op", "report")
         intent.putExtra("token", config.token)
-        intent.putExtras(report.toBundle())
+        if (wrote) {
+            intent.putExtra("op", if (report.stop) "stop" else "hold")
+        } else {
+            intent.putExtra("op", "report")
+            intent.putExtras(report.toBundle())
+        }
         try {
             context.startService(intent)
         } catch (error: Throwable) {
             noteHookError("启动守护进程失败: ${error.javaClass.simpleName}")
+        }
+    }
+
+    private fun writeReport(context: Context, report: Report): Boolean {
+        return try {
+            context.contentResolver.call(CONFIG_AUTHORITY, "report", null, report.toBundle()) != null
+        } catch (error: Throwable) {
+            KLog.i("provider report failed: ${error.javaClass.simpleName}")
+            false
         }
     }
 

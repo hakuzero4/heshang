@@ -55,6 +55,7 @@ import androidx.compose.ui.unit.sp
 import com.minedie.keepalive.R
 import com.minedie.keepalive.core.EventType
 import com.minedie.keepalive.core.Ranges
+import com.minedie.keepalive.core.componentClass
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -82,8 +83,8 @@ internal fun OverviewScreen(
         Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             StatCard(
                 state.protectedCount.toString(),
-                "个",
-                "保护中应用 · ${state.runningCount} 运行中",
+                "个应用",
+                "${state.serviceCount} 个服务",
                 Modifier.weight(1f),
                 onOpenGuard,
             )
@@ -108,7 +109,7 @@ internal fun OverviewScreen(
         SoftCard {
             Text("最近事件", color = Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(8.dp))
-            EventList(state.recent, showLine = true)
+            EventList(state.recent, showLine = true, state.guardServices)
         }
     }
 }
@@ -234,10 +235,11 @@ private fun SettingSlider(
 internal fun GuardScreen(
     state: UiState,
     onShowSystem: (Boolean) -> Unit,
-    onApp: (String, String, Boolean, String) -> Unit,
+    onApp: (String, String, Boolean, List<String>) -> Unit,
     servicesOf: (String) -> List<ServiceChoice>,
     onRetry: (String) -> Unit,
     onOpenServices: () -> Unit,
+    onRequestApps: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf<AppRow?>(null) }
@@ -296,13 +298,31 @@ internal fun GuardScreen(
                 inner()
             },
         )
+        if (state.appListLimited) {
+            Row(
+                Modifier
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.White)
+                    .clickable(onClick = onRequestApps)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("读取应用列表", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                    Text("系统没有交出其他应用", color = Muted, fontSize = 12.sp)
+                }
+                Text("允许", color = Blue, fontSize = 14.sp)
+            }
+        }
         LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
             items(visible, key = { it.packageName }, contentType = { "app" }) { app ->
                 AppLine(
                     app,
                     onToggle = { enabled ->
-                        if (enabled && app.component.isBlank()) editing = app else {
-                            onApp(app.packageName, app.label, enabled, app.component)
+                        if (enabled && app.components.isEmpty()) editing = app else {
+                            onApp(app.packageName, app.label, enabled, app.components)
                         }
                     },
                     onOpen = { editing = app },
@@ -317,8 +337,8 @@ internal fun GuardScreen(
             app = current,
             servicesOf = servicesOf,
             onDismiss = { editing = null },
-            onPick = { component ->
-                onApp(current.packageName, current.label, true, component)
+            onPick = { components ->
+                onApp(current.packageName, current.label, true, components)
                 editing = null
             },
         )
@@ -369,10 +389,10 @@ private fun AppLine(
                 Text(
                     if (app.gaveUp) {
                         "已停止重试"
-                    } else if (app.component.isBlank()) {
+                    } else if (app.components.isEmpty()) {
                         "未选 Service · 只检测掉线"
                     } else {
-                        app.component.substringAfterLast('.')
+                        app.components.joinToString("、") { simpleClass(it) }
                     },
                     color = Muted,
                     fontSize = 12.sp,
@@ -391,9 +411,10 @@ private fun ServiceDialog(
     app: AppRow,
     servicesOf: (String) -> List<ServiceChoice>,
     onDismiss: () -> Unit,
-    onPick: (String) -> Unit,
+    onPick: (List<String>) -> Unit,
 ) {
     var services by remember(app.packageName) { mutableStateOf<List<ServiceChoice>?>(null) }
+    var selected by remember(app.packageName) { mutableStateOf(app.components) }
     LaunchedEffect(app.packageName) {
         services = withContext(Dispatchers.IO) { servicesOf(app.packageName) }
     }
@@ -402,9 +423,9 @@ private fun ServiceDialog(
         title = { Text(app.label) },
         text = {
             Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                Text("选择一个 Service。选中后掉线会静默拉起，不会打开界面。", color = Muted, fontSize = 13.sp)
+                Text("可以选多个 Service。掉线后会静默拉起，不会打开界面。", color = Muted, fontSize = 13.sp)
                 Spacer(Modifier.height(8.dp))
-                ServiceRow("只检测掉线", "不拉起进程", app.component.isBlank()) { onPick("") }
+                ServiceRow("只检测掉线", "不拉起进程", selected.isEmpty()) { onPick(emptyList()) }
                 val loaded = services
                 if (loaded == null) {
                     Text("正在读取 Service", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
@@ -412,21 +433,39 @@ private fun ServiceDialog(
                     Text("这个应用没有 Service", color = Muted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 8.dp))
                 } else {
                     loaded.forEach { service ->
+                        val picked = selected.any { sameComponent(app.packageName, it, service.component) }
                         ServiceRow(
                             service.label,
                             service.className,
-                            service.component == app.component,
+                            picked,
                             foreground = service.foreground,
                         ) {
-                            onPick(service.component)
+                            selected = if (picked) {
+                                selected.filterNot { sameComponent(app.packageName, it, service.component) }
+                            } else {
+                                selected + service.component
+                            }
                         }
                     }
                 }
             }
         },
-        confirmButton = {},
+        confirmButton = {
+            TextButton(onClick = { onPick(selected) }) { Text("完成") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
+}
+
+private fun sameComponent(packageName: String, left: String, right: String): Boolean {
+    val a = componentClass(left, packageName)
+    val b = componentClass(right, packageName)
+    return a != null && a == b
+}
+
+private fun simpleClass(flat: String): String {
+    val cls = flat.substringAfterLast('/')
+    return cls.substringAfterLast('.').removePrefix(".").ifBlank { cls }
 }
 
 @Composable
@@ -508,7 +547,7 @@ internal fun LogScreen(state: UiState, startsOnly: Boolean = false) {
         }
         LazyColumn(contentPadding = PaddingValues(16.dp), modifier = Modifier.fillMaxSize()) {
             items(shown, key = { it.id }) { event ->
-                EventRow(event)
+                EventRow(event, guardServices = state.guardServices)
             }
             if (shown.isEmpty()) {
                 item { Text("暂无事件", color = Muted, modifier = Modifier.padding(8.dp)) }

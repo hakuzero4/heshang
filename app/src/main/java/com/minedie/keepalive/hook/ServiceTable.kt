@@ -13,14 +13,20 @@ internal data class RunningService(
  * Reads services that currently have a process. The map lives on ActivityManagerService,
  * so this only works inside system_server.
  */
+internal data class ServiceSnapshot(
+    val services: List<RunningService>,
+    /** False when the map was missing or empty, so a failed read is not "every service is dead". */
+    val trusted: Boolean,
+)
+
 internal object ServiceTable {
-    fun read(ams: Any): List<RunningService> {
+    fun read(ams: Any): ServiceSnapshot {
         return try {
             synchronized(ams) {
-                val active = XposedHelpers.getObjectField(ams, "mServices") ?: return emptyList()
-                val users = XposedHelpers.getObjectField(active, "mServiceMap") ?: return emptyList()
+                val active = XposedHelpers.getObjectField(ams, "mServices") ?: return ServiceSnapshot(emptyList(), false)
+                val users = XposedHelpers.getObjectField(active, "mServiceMap") ?: return ServiceSnapshot(emptyList(), false)
                 val found = LinkedHashMap<String, RunningService>()
-                val count = XposedHelpers.callMethod(users, "size") as? Int ?: return emptyList()
+                val count = XposedHelpers.callMethod(users, "size") as? Int ?: return ServiceSnapshot(emptyList(), false)
                 for (index in 0 until count) {
                     val userMap = XposedHelpers.callMethod(users, "valueAt", index) ?: continue
                     val table = XposedHelpers.getObjectField(userMap, "mServicesByInstanceName") as? Map<*, *>
@@ -30,11 +36,12 @@ internal object ServiceTable {
                         found.putIfAbsent("${row.packageName}/${row.className}/${row.processName}", row)
                     }
                 }
-                found.values.toList()
+                val rows = found.values.toList()
+                ServiceSnapshot(rows, rows.isNotEmpty())
             }
         } catch (error: Throwable) {
             Watchdog.noteHookError("读取服务表失败: ${error.javaClass.simpleName}")
-            emptyList()
+            ServiceSnapshot(emptyList(), false)
         }
     }
 

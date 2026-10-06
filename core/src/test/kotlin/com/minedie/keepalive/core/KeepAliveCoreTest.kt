@@ -70,7 +70,7 @@ class KeepAliveCoreTest {
         val out = PatrolPolicy.decide(
             base(apps = listOf(sceneWithService), alive = emptySet(), memory = first.memory),
         )
-        assertEquals(EventType.PROCESS_LOST, out.events.single().type)
+        assertEquals("检测到掉线 · Scene · KeepService", out.events.single().title)
         assertEquals(listOf(sceneWithService), out.startComponents)
         assertTrue(out.memory.getValue(scene.packageName).awaitingResult)
     }
@@ -118,7 +118,7 @@ class KeepAliveCoreTest {
         val back = PatrolPolicy.decide(
             base(apps = listOf(sceneWithService), alive = setOf(scene.packageName), memory = memory),
         )
-        assertEquals(listOf(EventType.SILENT_START_OK), back.events.map { it.type })
+        assertEquals(listOf("静默拉起 · Scene · KeepService"), back.events.map { it.title })
         assertEquals(0, back.memory.getValue(scene.packageName).failures)
     }
 
@@ -183,13 +183,25 @@ class KeepAliveCoreTest {
             StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, null, 20_000, 1, 0)).title,
         )
         assertEquals(
-            "看门狗异常",
+            "守护运行中",
             StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 40_001, 20_000, 1, 0)).title,
         )
         assertEquals(
-            "看门狗正在拉起守护进程",
-            StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000, 0, 0)).title,
+            "看门狗异常",
+            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 90_001, 20_000, 1, 0)).title,
         )
+        val opening = StatusMachine.derive(
+            StatusInput(true, true, Phase.RUNNING, 180_000, 5_000, 0, 0, awaitingHeartbeat = true),
+        )
+        assertEquals("守护运行中", opening.title)
+        assertTrue(opening.healthy)
+        val pulling = StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000, 0, 0))
+        assertEquals("守护运行中", pulling.title)
+        assertEquals("巡检正常", pulling.subtitle)
+        assertTrue(pulling.healthy)
+        val stuck = StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000, 0, 6))
+        assertEquals("看门狗正在拉起守护进程", stuck.title)
+        assertEquals(StatusMachine.PULL_WARNING, stuck.warning)
         val warned = StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 1_000, 20_000, 4, 6))
         assertEquals(StatusMachine.PULL_WARNING, warned.warning)
     }
@@ -305,6 +317,150 @@ class KeepAliveCoreTest {
     }
 
     @Test
+    fun startupAllowMatchesEverySelectedService() {
+        val monitor = "net.dinglisch.android.taskerm/net.dinglisch.android.taskerm.MonitorService"
+        val listener = "net.dinglisch.android.taskerm/.NotificationListenerService"
+        val tasker = GuardedApp(
+            "net.dinglisch.android.taskerm",
+            "Tasker",
+            monitor,
+            components = listOf(monitor, listener),
+        )
+        assertTrue(
+            StartupAllow.matches(
+                true,
+                listOf(tasker),
+                tasker.packageName,
+                "net.dinglisch.android.taskerm.MonitorService",
+            ),
+        )
+        assertTrue(
+            StartupAllow.matches(
+                true,
+                listOf(tasker),
+                tasker.packageName,
+                "net.dinglisch.android.taskerm.NotificationListenerService",
+            ),
+        )
+        assertFalse(
+            StartupAllow.matches(
+                true,
+                listOf(tasker),
+                tasker.packageName,
+                "net.dinglisch.android.taskerm.MyAccessibilityService",
+            ),
+        )
+    }
+
+    @Test
+    fun twoServicesStartTheMissingOneWhileTheProcessStaysUp() {
+        val monitor = "net.dinglisch.android.taskerm/net.dinglisch.android.taskerm.MonitorService"
+        val listener = "net.dinglisch.android.taskerm/.NotificationListenerService"
+        val tasker = GuardedApp(
+            "net.dinglisch.android.taskerm",
+            "Tasker",
+            monitor,
+            components = listOf(monitor, listener),
+        )
+        val pkg = tasker.packageName
+        val monitorKey = "$pkg/net.dinglisch.android.taskerm.MonitorService"
+        val listenerKey = "$pkg/net.dinglisch.android.taskerm.NotificationListenerService"
+        val both = setOf(monitorKey, listenerKey)
+        val onlyMonitor = setOf(monitorKey)
+
+        val first = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = setOf(pkg), runningServices = onlyMonitor),
+        )
+        assertTrue(first.startComponents.isEmpty())
+
+        val armed = first.memory + (pkg to first.memory.getValue(pkg).copy(forceRetry = true))
+        val pulled = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = setOf(pkg), memory = armed, runningServices = onlyMonitor),
+        )
+        assertEquals(listOf(listener), pulled.startComponents.map { it.component })
+
+        val seen = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = setOf(pkg), runningServices = both),
+        )
+        val dropped = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = setOf(pkg), memory = seen.memory, runningServices = onlyMonitor),
+        )
+        assertEquals(listOf(listener), dropped.startComponents.map { it.component })
+        assertEquals(
+            listOf("检测到掉线 · Tasker · NotificationListenerService"),
+            dropped.events.filter { it.type == EventType.PROCESS_LOST }.map { it.title },
+        )
+
+        val dead = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = emptySet(), memory = seen.memory, runningServices = emptySet()),
+        )
+        assertEquals(setOf(monitor, listener), dead.startComponents.map { it.component }.toSet())
+
+        val capped = seen.memory + (pkg to seen.memory.getValue(pkg).copy(
+            wasAlive = true,
+            serviceFailures = mapOf(listener to 3),
+        ))
+        val stillMonitor = PatrolPolicy.decide(
+            base(apps = listOf(tasker), alive = emptySet(), memory = capped, runningServices = emptySet()),
+        )
+        assertEquals(listOf(monitor), stillMonitor.startComponents.map { it.component })
+    }
+
+    @Test
+    fun guardTotalsCountAppsAndServicesSeparately() {
+        val tasker = GuardedApp(
+            "net.dinglisch.android.taskerm",
+            "Tasker",
+            "net.dinglisch.android.taskerm/.MonitorService",
+            components = listOf(
+                "net.dinglisch.android.taskerm/.MonitorService",
+                "net.dinglisch.android.taskerm/.NotificationListenerService",
+            ),
+        )
+        val totals = guardTotals(
+            listOf(
+                sceneWithService,
+                GuardedApp("app.revanced.android.gms", "microG", "app.revanced.android.gms/.McsService"),
+                tasker,
+                GuardedApp("com.radolyn.ayugram", "AyuGram", enabled = false),
+            ),
+        )
+        assertEquals(3, totals.apps)
+        assertEquals(4, totals.services)
+    }
+
+    @Test
+    fun oldLogTitlesGainTheGuardedServiceName() {
+        val services = mapOf(
+            "net.dinglisch.android.taskerm" to listOf(
+                "net.dinglisch.android.taskerm/net.dinglisch.android.taskerm.MonitorService",
+            ),
+        )
+        assertEquals(
+            "静默拉起 · Tasker · MonitorService",
+            EventText.shownTitle(
+                EventType.SILENT_START_OK.name,
+                "静默拉起 · Tasker",
+                "net.dinglisch.android.taskerm",
+                services,
+            ),
+        )
+        assertEquals(
+            "静默拉起 · Tasker · MonitorService",
+            EventText.shownTitle(
+                EventType.SILENT_START_OK.name,
+                "静默拉起 · Tasker · MonitorService",
+                "net.dinglisch.android.taskerm",
+                services,
+            ),
+        )
+        assertEquals(
+            "已拉起守护进程",
+            EventText.shownTitle(EventType.WATCHDOG_PULLED_DAEMON.name, "已拉起守护进程", null, services),
+        )
+    }
+
+    @Test
     fun packageAliveMatchesSubprocessesOnly() {
         val names = setOf("com.example", "com.example:push", "com.example2")
         assertTrue(isPackageAlive(names, "com.example"))
@@ -322,6 +478,7 @@ class KeepAliveCoreTest {
         memory: Map<String, AppMemory> = emptyMap(),
         guardedA11y: Set<String> = emptySet(),
         enabledA11y: String? = "",
+        runningServices: Set<String>? = null,
     ) = PatrolInput(
         masterEnabled = master,
         bootReady = bootReady,
@@ -332,5 +489,6 @@ class KeepAliveCoreTest {
         memory = memory,
         guardedA11y = guardedA11y,
         enabledA11yRaw = enabledA11y,
+        runningServices = runningServices,
     )
 }

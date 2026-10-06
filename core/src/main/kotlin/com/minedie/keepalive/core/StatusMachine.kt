@@ -8,6 +8,7 @@ data class StatusInput(
     val intervalMs: Long,
     val daemonPid: Int,
     val watchdogPullsLastHour: Int,
+    val awaitingHeartbeat: Boolean = false,
 )
 
 data class StatusView(
@@ -20,6 +21,7 @@ data class StatusView(
 object StatusMachine {
     const val PULL_WARNING = "守护进程反复被系统回收"
     const val PULL_WARNING_LIMIT = 5
+    const val HEARTBEAT_FLOOR_MS = 90_000L
 
     fun derive(input: StatusInput): StatusView {
         val warning = if (input.watchdogPullsLastHour > PULL_WARNING_LIMIT) PULL_WARNING else null
@@ -48,7 +50,9 @@ object StatusMachine {
                 warning = warning,
             )
         }
-        if (input.intervalMs > 0 && age > input.intervalMs * 2) {
+        // ColorOS freezes this app during games, so a short gap is not a dead watchdog.
+        val limit = maxOf(input.intervalMs * 2, HEARTBEAT_FLOOR_MS)
+        if (input.intervalMs > 0 && age > limit && !input.awaitingHeartbeat) {
             return StatusView(
                 title = "看门狗异常",
                 subtitle = "心跳超时",
@@ -64,7 +68,7 @@ object StatusMachine {
                 warning = warning,
             )
         }
-        if (input.daemonPid <= 0) {
+        if (input.daemonPid <= 0 && input.watchdogPullsLastHour > PULL_WARNING_LIMIT) {
             return StatusView(
                 title = "看门狗正在拉起守护进程",
                 subtitle = "守护进程暂时不在",
@@ -72,9 +76,14 @@ object StatusMachine {
                 warning = warning,
             )
         }
+        val subtitle = if (input.daemonPid > 0) {
+            "看门狗与守护进程均正常 · pid ${input.daemonPid}"
+        } else {
+            "巡检正常"
+        }
         return StatusView(
             title = "守护运行中",
-            subtitle = "看门狗与守护进程均正常 · pid ${input.daemonPid}",
+            subtitle = subtitle,
             healthy = true,
             warning = warning,
         )

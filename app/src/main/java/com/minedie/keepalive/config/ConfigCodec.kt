@@ -10,11 +10,13 @@ internal object ConfigCodec {
     fun appsToJson(apps: List<GuardedApp>): String {
         val array = JSONArray()
         apps.forEach { app ->
+            val targets = app.targets()
             array.put(
                 JSONObject()
                     .put("pkg", app.packageName)
                     .put("label", app.label)
-                    .put("component", app.component)
+                    .put("component", targets.firstOrNull().orEmpty())
+                    .put("components", JSONArray(targets))
                     .put("enabled", app.enabled),
             )
         }
@@ -30,12 +32,24 @@ internal object ConfigCodec {
                     val item = array.optJSONObject(index) ?: continue
                     val pkg = item.optString("pkg")
                     if (pkg.isBlank()) continue
+                    val listed = buildList {
+                        val array = item.optJSONArray("components")
+                        if (array != null) {
+                            for (cursor in 0 until array.length()) {
+                                val value = array.optString(cursor).trim()
+                                if (value.isNotBlank()) add(value)
+                            }
+                        }
+                    }.distinct()
+                    val single = item.optString("component").trim()
+                    val targets = listed.ifEmpty { listOf(single).filter { it.isNotBlank() } }
                     add(
                         GuardedApp(
                             packageName = pkg,
                             label = item.optString("label").ifBlank { pkg },
-                            component = item.optString("component"),
+                            component = targets.firstOrNull().orEmpty(),
                             enabled = item.optBoolean("enabled", true),
+                            components = targets,
                         ),
                     )
                 }

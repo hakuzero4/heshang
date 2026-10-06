@@ -11,6 +11,8 @@ data class PatrolInput(
     val guardedA11y: Set<String>,
     val enabledA11yRaw: String?,
     val failureCap: Int = 3,
+    /** package/class keys of services with a process. Null means the table was not read. */
+    val runningServices: Set<String>? = null,
 )
 
 data class PatrolOutput(
@@ -69,17 +71,21 @@ object PatrolPolicy {
             if (app.packageName.isBlank() || !app.enabled) continue
             val prev = input.memory[app.packageName] ?: AppMemory()
             val alive = app.packageName in input.alivePackages
+            val targets = app.targets()
             var failures = prev.failures
             var gaveUp = prev.gaveUp
+            val serviceFailures = prev.serviceFailures.toMutableMap()
 
             if (prev.awaitingResult && alive) {
-                events += EventText.startOk(app.label, app.packageName)
+                val started = prev.awaitingServices.ifEmpty { targets }
+                events += EventText.startOk(app.label, app.packageName, started)
                 failures = 0
                 gaveUp = false
             } else if (prev.awaitingResult && !alive) {
                 failures += 1
                 gaveUp = failures >= input.failureCap
-                events += EventText.startFail(app.label, app.packageName)
+                val started = prev.awaitingServices.ifEmpty { targets }
+                events += EventText.startFail(app.label, app.packageName, components = started)
             }
             if (alive && !prev.awaitingResult) {
                 failures = 0
@@ -88,21 +94,71 @@ object PatrolPolicy {
 
             val dropped = prev.wasAlive == true && !alive
             if (dropped) {
-                events += EventText.lost(app.label, app.packageName)
+                events += EventText.lost(app.label, app.packageName, targets)
             }
-            val wantRetry = !alive &&
+
+            val known = input.runningServices
+            val runningNow = if (known == null) {
+                emptySet()
+            } else {
+                targets.filter { serviceRunning(known, app.packageName, it) }.toSet()
+            }
+            // A second service can die while the process stays up. Only count that when the table is known.
+            if (alive && known != null && !prev.awaitingResult) {
+                for (target in prev.awaitingServices) {
+                    if (target !in targets) continue
+                    if (target in runningNow) {
+                        serviceFailures.remove(target)
+                        events += EventText.startOk(app.label, app.packageName, listOf(target))
+                    } else {
+                        val count = (serviceFailures[target] ?: 0) + 1
+                        serviceFailures[target] = count
+                        events += EventText.startFail(app.label, app.packageName, components = listOf(target))
+                    }
+                }
+            } else if (alive && known != null) {
+                for (target in runningNow) serviceFailures.remove(target)
+            }
+
+            val wantProcess = !alive &&
                 !gaveUp &&
                 failures < input.failureCap &&
-                app.component.isNotBlank() &&
+                targets.isNotEmpty() &&
                 (dropped || prev.awaitingResult || prev.failures > 0 || prev.forceRetry)
-            if (wantRetry) {
-                starts += app
+            val launch = mutableListOf<String>()
+            if (wantProcess) {
+                launch += targets.filter { (serviceFailures[it] ?: 0) < input.failureCap }
+            } else if (alive && !gaveUp && targets.isNotEmpty() && known != null) {
+                for (target in targets) {
+                    if (target in runningNow) continue
+                    val count = serviceFailures[target] ?: 0
+                    if (count >= input.failureCap) continue
+                    val droppedService = target in prev.serviceSeen
+                    if (droppedService) {
+                        events += EventText.lost(app.label, app.packageName, listOf(target))
+                    }
+                    val missing = droppedService || target in prev.awaitingServices || count > 0
+                    if (missing || prev.forceRetry) launch += target
+                }
+            } else if (alive && !gaveUp && prev.forceRetry && known == null) {
+                launch += targets
+            }
+            val launched = launch.distinct()
+            for (flat in launched) {
+                starts += app.copy(component = flat)
             }
             nextMemory[app.packageName] = AppMemory(
                 wasAlive = alive,
                 failures = failures,
                 gaveUp = gaveUp,
-                awaitingResult = wantRetry,
+                awaitingResult = wantProcess && launched.isNotEmpty(),
+                serviceSeen = if (known == null) prev.serviceSeen else runningNow,
+                serviceFailures = serviceFailures,
+                awaitingServices = when {
+                    launched.isNotEmpty() -> launched.toSet()
+                    known == null -> prev.awaitingServices
+                    else -> emptySet()
+                },
             )
         }
 
@@ -136,7 +192,26 @@ object PatrolPolicy {
             gaveUp = gaveUp,
             awaitingResult = false,
         ))
-        return next to EventText.startFail(app.label, app.packageName, reason)
+        val named = listOf(app.component).filter { it.isNotBlank() }
+        return next to EventText.startFail(app.label, app.packageName, reason, named)
+    }
+
+    fun noteServiceFailure(
+        memory: Map<String, AppMemory>,
+        app: GuardedApp,
+        cap: Int = 3,
+        reason: String = "",
+    ): Pair<Map<String, AppMemory>, EventDraft?> {
+        val prev = memory[app.packageName] ?: AppMemory()
+        val key = app.component
+        if (key.isBlank() || prev.gaveUp) return memory to null
+        val count = (prev.serviceFailures[key] ?: 0) + 1
+        if (count > cap) return memory to null
+        val next = memory + (app.packageName to prev.copy(
+            serviceFailures = prev.serviceFailures + (key to count),
+            awaitingServices = prev.awaitingServices - key,
+        ))
+        return next to EventText.startFail(app.label, app.packageName, reason, listOf(key))
     }
 
     fun armStart(previousComponent: String?, component: String): Boolean {
@@ -145,12 +220,26 @@ object PatrolPolicy {
 
     fun resetGiveUps(memory: Map<String, AppMemory>): Map<String, AppMemory> {
         return memory.mapValues { (_, item) ->
-            item.copy(failures = 0, gaveUp = false, awaitingResult = false, forceRetry = true)
+            item.copy(
+                failures = 0,
+                gaveUp = false,
+                awaitingResult = false,
+                forceRetry = true,
+                serviceFailures = emptyMap(),
+                awaitingServices = emptySet(),
+            )
         }
     }
 
     fun retry(memory: Map<String, AppMemory>, packageName: String): Map<String, AppMemory> {
         val current = memory[packageName] ?: AppMemory()
-        return memory + (packageName to current.copy(failures = 0, gaveUp = false, awaitingResult = false, forceRetry = true))
+        return memory + (packageName to current.copy(
+            failures = 0,
+            gaveUp = false,
+            awaitingResult = false,
+            forceRetry = true,
+            serviceFailures = emptyMap(),
+            awaitingServices = emptySet(),
+        ))
     }
 }

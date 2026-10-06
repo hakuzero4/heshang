@@ -175,7 +175,11 @@ internal fun GreenSwitch(checked: Boolean, onChange: (Boolean) -> Unit) {
 }
 
 @Composable
-internal fun EventList(events: List<EventEntity>, showLine: Boolean) {
+internal fun EventList(
+    events: List<EventEntity>,
+    showLine: Boolean,
+    guardServices: Map<String, List<String>> = emptyMap(),
+) {
     if (events.isEmpty()) {
         Text("暂无事件", color = Muted, fontSize = 14.sp)
         return
@@ -185,12 +189,18 @@ internal fun EventList(events: List<EventEntity>, showLine: Boolean) {
             event,
             lineAbove = showLine && index > 0,
             lineBelow = showLine && index < events.lastIndex,
+            guardServices = guardServices,
         )
     }
 }
 
 @Composable
-internal fun EventRow(event: EventEntity, lineAbove: Boolean = false, lineBelow: Boolean = false) {
+internal fun EventRow(
+    event: EventEntity,
+    lineAbove: Boolean = false,
+    lineBelow: Boolean = false,
+    guardServices: Map<String, List<String>> = emptyMap(),
+) {
     val tone = runCatching { EventType.valueOf(event.type).tone() }.getOrDefault(EventTone.ACTION)
     val color = when (tone) {
         EventTone.ACTION -> Purple
@@ -224,11 +234,11 @@ internal fun EventRow(event: EventEntity, lineAbove: Boolean = false, lineBelow:
         Column(modifier = Modifier.weight(1f).padding(start = 8.dp, bottom = 14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    event.title,
+                    EventText.shownTitle(event.type, event.title, event.packageName, guardServices),
                     color = Ink,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f),
                 )

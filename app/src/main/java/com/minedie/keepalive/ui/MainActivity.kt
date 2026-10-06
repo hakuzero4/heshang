@@ -5,8 +5,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.SystemBarStyle
@@ -37,6 +40,8 @@ import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val model: KeepAliveViewModel by viewModels()
+    private var offeredAppList = false
+    private var askedApps = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,9 +49,8 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.light(PageBg.toArgb(), PageBg.toArgb()),
             navigationBarStyle = SystemBarStyle.light(Color.White.toArgb(), Color.White.toArgb()),
         )
-        if (Build.VERSION.SDK_INT >= 33) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
-        }
+        val permissions = startupPermissions()
+        if (permissions.isNotEmpty()) requestPermissions(permissions, 1)
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
             var tab by remember { mutableStateOf(Tab.Overview) }
@@ -71,6 +75,9 @@ class MainActivity : ComponentActivity() {
                     model.refresh()
                     delay(2000)
                 }
+            }
+            LaunchedEffect(tab, state.appListLimited) {
+                if (tab == Tab.Guard && state.appListLimited) offerAppList()
             }
             KeepAliveTheme {
                 BackHandler(enabled = showServices) { showServices = false }
@@ -127,6 +134,7 @@ class MainActivity : ComponentActivity() {
                                 model::appServices,
                                 model::retry,
                                 onOpenServices = { showServices = true },
+                                onRequestApps = { askForAppList() },
                             )
                         }
                         Tab.A11y -> androidx.compose.foundation.layout.Box(body) {
@@ -150,6 +158,66 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        model.onForeground()
+    }
+
+    override fun onStop() {
+        model.onBackground()
+        super.onStop()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        model.refresh(reloadApps = true)
+    }
+
+    private fun offerAppList() {
+        if (offeredAppList) return
+        offeredAppList = true
+        askForAppList()
+    }
+
+    private fun askForAppList() {
+        if (!installedAppsPermissionKnown()) return
+        if (checkSelfPermission(GET_INSTALLED_APPS) == PackageManager.PERMISSION_GRANTED) {
+            model.refresh(reloadApps = true)
+            return
+        }
+        if (askedApps && !shouldShowRequestPermissionRationale(GET_INSTALLED_APPS)) {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.fromParts("package", packageName, null)),
+            )
+            return
+        }
+        askedApps = true
+        requestPermissions(arrayOf(GET_INSTALLED_APPS), 1)
+    }
+
+    private fun startupPermissions(): Array<String> {
+        val names = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            names += Manifest.permission.POST_NOTIFICATIONS
+        }
+        return names.toTypedArray()
+    }
+
+    private fun installedAppsPermissionKnown(): Boolean {
+        return runCatching { packageManager.getPermissionInfo(GET_INSTALLED_APPS, 0) }.isSuccess
+    }
+
+    private companion object {
+        const val GET_INSTALLED_APPS = "com.android.permission.GET_INSTALLED_APPS"
     }
 }
 

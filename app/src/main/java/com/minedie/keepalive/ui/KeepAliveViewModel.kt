@@ -16,6 +16,8 @@ import com.minedie.keepalive.config.ConfigStore
 import com.minedie.keepalive.core.EventLog
 import com.minedie.keepalive.core.EventType
 import com.minedie.keepalive.core.GuardedApp
+import com.minedie.keepalive.core.canonicalComponent
+import com.minedie.keepalive.core.guardTotals
 import com.minedie.keepalive.core.LogRow
 import com.minedie.keepalive.core.Phase
 import com.minedie.keepalive.core.StatusInput
@@ -45,6 +47,7 @@ data class AppRow(
     val running: Boolean,
     val system: Boolean,
     val gaveUp: Boolean,
+    val components: List<String> = emptyList(),
 )
 
 data class LiveService(
@@ -69,6 +72,7 @@ data class UiState(
     val bootDelaySec: Int = 20,
     val retention: Int = 300,
     val protectedCount: Int = 0,
+    val serviceCount: Int = 0,
     val runningCount: Int = 0,
     val silentStarts: Int = 0,
     val a11yCount: Int = 0,
@@ -79,7 +83,9 @@ data class UiState(
     val showSystem: Boolean = false,
     val liveServices: List<LiveService> = emptyList(),
     val liveServicesKnown: Boolean = false,
+    val appListLimited: Boolean = false,
     val versionName: String = BuildConfig.VERSION_NAME,
+    val guardServices: Map<String, List<String>> = emptyMap(),
 )
 
 class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
@@ -89,8 +95,19 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<UiState> = stateFlow
     private var installed: List<RawApp> = emptyList()
     private var installedAt = 0L
+    @Volatile private var visibleSince = 0L
 
-    fun refresh() {
+    fun onForeground() {
+        visibleSince = System.currentTimeMillis()
+        refresh()
+    }
+
+    fun onBackground() {
+        visibleSince = 0L
+    }
+
+    fun refresh(reloadApps: Boolean = false) {
+        if (reloadApps) installedAt = 0L
         viewModelScope.launch {
             val snapshot = withContext(Dispatchers.IO) { readState() }
             stateFlow.value = snapshot
@@ -155,11 +172,21 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
 
-    fun setApp(packageName: String, label: String, enabled: Boolean, component: String) {
+    fun setApp(packageName: String, label: String, enabled: Boolean, components: List<String>) {
         viewModelScope.launch(Dispatchers.IO) {
             val current = store.load().apps.toMutableList()
             val index = current.indexOfFirst { it.packageName == packageName }
-            val updated = GuardedApp(packageName, label, component.trim(), enabled)
+            val previous = if (index >= 0) current[index].targets() else emptyList()
+            val picked = components.mapNotNull { canonicalComponent(packageName, it) }.distinct()
+            val kept = previous.mapNotNull { canonicalComponent(packageName, it) }.filter { it in picked }
+            val ordered = (kept + picked.filter { it !in kept }).distinct()
+            val updated = GuardedApp(
+                packageName,
+                label,
+                ordered.firstOrNull().orEmpty(),
+                enabled,
+                ordered,
+            )
             if (index >= 0) current[index] = updated else current += updated
             store.setApps(current)
             send("rescan")
@@ -196,7 +223,7 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
         val app = getApplication<Application>()
         val config = store.load()
         val now = System.currentTimeMillis()
-        if (now - installedAt > 30_000L || installed.isEmpty()) {
+        if (now - installedAt > 30_000L || installed.size <= 1) {
             installed = loadInstalled(app)
             installedAt = now
         }
@@ -215,17 +242,35 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         val enabledApps = config.apps.filter { it.enabled }
+        val totals = guardTotals(config.apps)
         val guarded = config.apps.associateBy { it.packageName }
         val rows = installed.map { raw ->
             val saved = guarded[raw.packageName]
+            val selected = saved?.targets().orEmpty()
             AppRow(
                 packageName = raw.packageName,
                 label = raw.label,
-                component = saved?.component.orEmpty(),
+                component = selected.firstOrNull().orEmpty(),
                 enabled = saved?.enabled == true,
                 running = raw.packageName in running,
                 system = raw.system,
                 gaveUp = raw.packageName in gaveUpPackages,
+                components = selected,
+            )
+        }
+        val seen = rows.mapTo(HashSet()) { it.packageName }
+        val withSaved = rows + config.apps.mapNotNull { saved ->
+            if (saved.packageName in seen) return@mapNotNull null
+            val selected = saved.targets()
+            AppRow(
+                packageName = saved.packageName,
+                label = saved.label.ifBlank { saved.packageName },
+                component = selected.firstOrNull().orEmpty(),
+                enabled = saved.enabled,
+                running = saved.packageName in running,
+                system = false,
+                gaveUp = saved.packageName in gaveUpPackages,
+                components = selected,
             )
         }
         val logRows = logs.mapNotNull { entity ->
@@ -234,6 +279,11 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
         }
         val phase = snap?.phase?.let { runCatching { Phase.valueOf(it) }.getOrNull() } ?: Phase.PAUSED
         val age = snap?.let { now - it.reportedAt }
+        val since = visibleSince
+        val grace = maxOf(OPEN_GRACE_MS, config.intervalSec * 1000L + 5_000L)
+        val awaitingHeartbeat = since > 0L &&
+            (snap?.reportedAt ?: 0L) < since &&
+            now - since < grace
         val status = StatusMachine.derive(
             StatusInput(
                 moduleActive = ModuleProbe.isActive(),
@@ -243,6 +293,7 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
                 intervalMs = config.intervalSec * 1000L,
                 daemonPid = snap?.daemonPid ?: 0,
                 watchdogPullsLastHour = snap?.pullsLastHour ?: 0,
+                awaitingHeartbeat = awaitingHeartbeat,
             ),
         )
         return UiState(
@@ -254,17 +305,20 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
             intervalSec = config.intervalSec,
             bootDelaySec = config.bootDelaySec,
             retention = config.retention,
-            protectedCount = enabledApps.size,
+            protectedCount = totals.apps,
+            serviceCount = totals.services,
             runningCount = enabledApps.count { it.packageName in running },
             silentStarts = EventLog.countSince(logRows, EventType.SILENT_START_OK, now, DAY),
             a11yCount = config.a11y.size,
             recent = recent,
             logs = logs,
-            apps = rows,
+            apps = withSaved,
             services = services.map { A11yRow(it.id, it.label, it.id in config.a11y) },
             showSystem = config.showSystem,
             liveServices = liveServices,
             liveServicesKnown = serviceJson.isNotBlank(),
+            guardServices = config.apps.associate { it.packageName to it.targets() },
+            appListLimited = installed.count { !it.system } <= 1,
         )
     }
 
@@ -282,15 +336,36 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun loadInstalled(app: Application): List<RawApp> {
         val pm = app.packageManager
-        return pm.getInstalledApplications(PackageManager.MATCH_ALL)
-            .map { info ->
-                RawApp(
-                    packageName = info.packageName,
-                    label = pm.getApplicationLabel(info).toString(),
-                    system = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
-                )
+        val byPackage = LinkedHashMap<String, RawApp>()
+        val installed = runCatching { pm.getInstalledApplications(PackageManager.MATCH_ALL) }.getOrDefault(emptyList())
+        for (info in installed) {
+            byPackage[info.packageName] = rawApp(pm, info)
+        }
+        // ColorOS hides getInstalledApplications until GET_INSTALLED_APPS is granted.
+        // Launcher resolution still returns the other apps when QUERY_ALL_PACKAGES is granted.
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val resolved = runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                pm.queryIntentActivities(launcher, PackageManager.ResolveInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(launcher, 0)
             }
-            .sortedBy { it.label.lowercase() }
+        }.getOrDefault(emptyList())
+        for (resolve in resolved) {
+            val info = resolve.activityInfo?.applicationInfo ?: continue
+            if (info.packageName in byPackage) continue
+            byPackage[info.packageName] = rawApp(pm, info)
+        }
+        return byPackage.values.sortedBy { it.label.lowercase() }
+    }
+
+    private fun rawApp(pm: PackageManager, info: ApplicationInfo): RawApp {
+        return RawApp(
+            packageName = info.packageName,
+            label = runCatching { pm.getApplicationLabel(info).toString() }.getOrDefault(info.packageName),
+            system = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
+        )
     }
 
     private fun loadServices(app: Application): List<RawService> {
@@ -305,5 +380,6 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
 
     private companion object {
         const val DAY = 24L * 60L * 60L * 1000L
+        const val OPEN_GRACE_MS = 15_000L
     }
 }

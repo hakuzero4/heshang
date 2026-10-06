@@ -11,6 +11,7 @@ import android.os.IBinder
 import android.util.Log
 import com.minedie.keepalive.R
 import com.minedie.keepalive.config.ConfigStore
+import com.minedie.keepalive.core.Phase
 import com.minedie.keepalive.data.Report
 import com.minedie.keepalive.data.ReportWriter
 import kotlinx.coroutines.runBlocking
@@ -30,7 +31,25 @@ class DaemonService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        val report = Report.fromBundle(intent?.extras ?: return START_NOT_STICKY)
+        when (intent?.getStringExtra("op")) {
+            "hold" -> return START_NOT_STICKY
+            "stop" -> {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        }
+        val incoming = Report.fromBundle(intent?.extras ?: return START_NOT_STICKY)
+        // The watchdog samples the pid before startService, so a pull report still says 0.
+        // This process is the daemon, and writing that 0 keeps the overview on the pulling card.
+        val report = if (incoming.stop || incoming.daemonPid > 0) {
+            incoming
+        } else {
+            incoming.copy(
+                daemonPid = android.os.Process.myPid(),
+                phase = if (incoming.phase == Phase.PULLING) Phase.RUNNING else incoming.phase,
+            )
+        }
         runBlocking { ReportWriter.write(this@DaemonService, report) }
         if (report.stop) {
             stopForeground(STOP_FOREGROUND_REMOVE)

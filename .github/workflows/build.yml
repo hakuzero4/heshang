@@ -2,10 +2,15 @@ name: build
 
 on:
   push:
+    branches:
+      - "**"
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
-  debug:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -21,12 +26,66 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Test and assemble
-        run: ./gradlew :core:test :app:assembleDebug --stacktrace
+      - name: Test and assemble release
+        run: ./gradlew :core:test :app:assembleRelease -PVERSION_CODE=${{ github.run_number }} --stacktrace
 
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'push'
         with:
-          name: heshang-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: heshang-release
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/output-metadata.json
           if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: heshang-release
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          meta=$(find dist -name output-metadata.json -print -quit)
+          if [ -z "${meta}" ]; then
+            echo "output-metadata.json not found"
+            exit 1
+          fi
+          dir=$(dirname "${meta}")
+          file=$(jq -r '.elements[0].outputFile' "${meta}")
+          name=$(jq -r '.elements[0].versionName' "${meta}")
+          if [ -z "${file}" ] || [ "${file}" = "null" ] || [ -z "${name}" ] || [ "${name}" = "null" ]; then
+            echo "Release metadata is incomplete"
+            exit 1
+          fi
+          case "${file}" in
+            *unsigned*)
+              echo "Refusing to publish an unsigned APK: ${file}"
+              exit 1
+              ;;
+          esac
+          if [ ! -f "${dir}/${file}" ]; then
+            echo "APK not found: ${dir}/${file}"
+            exit 1
+          fi
+          tag="v${name}"
+          asset="heshang-${tag}.apk"
+          cp "${dir}/${file}" "${asset}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${asset}" --clobber
+          else
+            gh release create "${tag}" "${asset}" \
+              --target "${{ github.sha }}" \
+              --title "和尚 ${name}" \
+              --generate-notes
+          fi

@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -5,21 +7,45 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+val releaseVersion = "1.0.0"
+val releaseBuild = (findProperty("VERSION_CODE") as String?)?.toIntOrNull()
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+
 android {
     namespace = "com.minedie.keepalive"
     compileSdk = 36
+
+    signingConfigs {
+        if (keystorePropertiesFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                storeType = keystoreProperties.getProperty("storeType") ?: "PKCS12"
+            }
+        }
+    }
 
     defaultConfig {
         applicationId = "com.hakuzero.heshang"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = releaseBuild ?: 1
+        versionName = if (releaseBuild != null) "$releaseVersion.$releaseBuild" else releaseVersion
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePropertiesFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

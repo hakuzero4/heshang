@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <permission
+        android:name="${applicationId}.permission.CONTROL"
+        android:protectionLevel="signature" />
+
+    <uses-permission android:name="${applicationId}.permission.CONTROL" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <uses-permission android:name="com.android.permission.GET_INSTALLED_APPS" />
 
@@ -24,21 +26,6 @@
             </intent-filter>
         </activity>
 
-        <service
-            android:name=".daemon.DaemonService"
-            android:exported="true"
-            android:foregroundServiceType="specialUse"
-            android:process=":daemon">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Keep the module watchdog process alive so ColorOS does not freeze patrol." />
-        </service>
-
-        <provider
-            android:name=".config.ConfigProvider"
-            android:authorities="${applicationId}.config"
-            android:exported="true" />
-
         <meta-data
             android:name="xposedmodule"
             android:value="true" />
@@ -47,7 +34,7 @@
             android:value="@string/xposed_desc" />
         <meta-data
             android:name="xposedminversion"
-            android:value="93" />
+            android:value="82" />
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />

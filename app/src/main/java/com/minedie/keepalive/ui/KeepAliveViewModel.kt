@@ -9,10 +9,10 @@ import android.os.Build
 import android.view.accessibility.AccessibilityManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.minedie.keepalive.ACTION_CONTROL
 import com.minedie.keepalive.BuildConfig
 import com.minedie.keepalive.config.ConfigCodec
 import com.minedie.keepalive.config.ConfigStore
+import com.minedie.keepalive.config.ControlBus
 import com.minedie.keepalive.core.EventLog
 import com.minedie.keepalive.core.EventType
 import com.minedie.keepalive.core.GuardedApp
@@ -27,8 +27,11 @@ import com.minedie.keepalive.data.KeepAliveDb
 import com.minedie.keepalive.data.ReportWriter
 import com.minedie.keepalive.xposed.ModuleProbe
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -95,15 +98,24 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<UiState> = stateFlow
     private var installed: List<RawApp> = emptyList()
     private var installedAt = 0L
+    private var polling: Job? = null
     @Volatile private var visibleSince = 0L
 
     fun onForeground() {
         visibleSince = System.currentTimeMillis()
-        refresh()
+        polling?.cancel()
+        polling = viewModelScope.launch {
+            while (isActive) {
+                pull()
+                delay(POLL_MS)
+            }
+        }
     }
 
     fun onBackground() {
         visibleSince = 0L
+        polling?.cancel()
+        polling = null
     }
 
     fun refresh(reloadApps: Boolean = false) {
@@ -204,8 +216,8 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun restartDaemon() {
-        send("restart")
+    fun patrolNow() {
+        send("rescan")
     }
 
     fun clearLogs() {
@@ -291,8 +303,6 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
                 phase = phase,
                 snapshotAgeMs = age,
                 intervalMs = config.intervalSec * 1000L,
-                daemonPid = snap?.daemonPid ?: 0,
-                watchdogPullsLastHour = snap?.pullsLastHour ?: 0,
                 awaitingHeartbeat = awaitingHeartbeat,
             ),
         )
@@ -323,11 +333,17 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun send(op: String, packageName: String? = null) {
+        ControlBus.send(getApplication(), op, packageName)
+    }
+
+    private fun pull() {
         val app = getApplication<Application>()
-        val token = store.ensureToken()
-        val intent = Intent(ACTION_CONTROL).putExtra("op", op).putExtra("token", token)
-        if (packageName != null) intent.putExtra("package", packageName)
-        app.sendBroadcast(intent)
+        ControlBus.pull(app) { report ->
+            viewModelScope.launch(Dispatchers.IO) {
+                ReportWriter.write(app, report)
+                refresh()
+            }
+        }
     }
 
     private data class RawApp(val packageName: String, val label: String, val system: Boolean)
@@ -381,5 +397,6 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val DAY = 24L * 60L * 60L * 1000L
         const val OPEN_GRACE_MS = 15_000L
+        const val POLL_MS = 2_000L
     }
 }

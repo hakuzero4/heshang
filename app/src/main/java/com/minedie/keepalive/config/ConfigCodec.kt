@@ -3,6 +3,7 @@ package com.minedie.keepalive.config
 import com.minedie.keepalive.core.EventDraft
 import com.minedie.keepalive.core.EventType
 import com.minedie.keepalive.core.GuardedApp
+import com.minedie.keepalive.core.Ranges
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -143,4 +144,84 @@ internal object ConfigCodec {
             emptyList()
         }
     }
+
+    fun configToJson(config: StoredConfig): String {
+        return configToJson(
+            LoadedConfig(
+                master = config.master,
+                intervalSec = config.intervalSec,
+                bootDelaySec = config.bootDelaySec,
+                retention = config.retention,
+                token = config.token,
+                apps = config.apps,
+                a11y = config.a11y,
+            ),
+        )
+    }
+
+    fun configToJson(config: LoadedConfig): String {
+        return JSONObject()
+            .put(KEY_MASTER, config.master)
+            .put(KEY_INTERVAL, config.intervalSec)
+            .put(KEY_BOOT, config.bootDelaySec)
+            .put(KEY_RETENTION, config.retention)
+            .put(KEY_TOKEN, config.token)
+            .put(KEY_APPS, appsToJson(config.apps))
+            .put(KEY_A11Y, stringsToJson(config.a11y))
+            .toString()
+    }
+
+    fun configFromJson(raw: String?): LoadedConfig? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            val json = JSONObject(raw)
+            val token = json.optString(KEY_TOKEN)
+            if (token.isBlank()) return null
+            LoadedConfig(
+                master = json.optBoolean(KEY_MASTER, false),
+                intervalSec = Ranges.intervalSec(firstInt(json, KEY_INTERVAL, "interval_sec", 20)),
+                bootDelaySec = Ranges.bootDelaySec(firstInt(json, KEY_BOOT, "boot_delay_sec", 20)),
+                retention = Ranges.retention(firstInt(json, KEY_RETENTION, "log_retention", 300)),
+                token = token,
+                apps = appsFromJson(jsonField(json, KEY_APPS)),
+                a11y = stringsFromJson(jsonField(json, KEY_A11Y)),
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun firstInt(json: JSONObject, primary: String, legacy: String, fallback: Int): Int {
+        if (json.has(primary)) return json.optInt(primary, fallback)
+        if (json.has(legacy)) return json.optInt(legacy, fallback)
+        return fallback
+    }
+
+    /** The store writes `apps` and `a11y` as strings. A raw array is accepted too. */
+    private fun jsonField(json: JSONObject, key: String): String {
+        val value = json.opt(key)
+        return when (value) {
+            is String -> value
+            null, JSONObject.NULL -> ""
+            else -> value.toString()
+        }
+    }
+
+    private const val KEY_MASTER = "master"
+    private const val KEY_INTERVAL = "interval"
+    private const val KEY_BOOT = "bootDelay"
+    private const val KEY_RETENTION = "retention"
+    private const val KEY_TOKEN = "token"
+    private const val KEY_APPS = "apps"
+    private const val KEY_A11Y = "a11y"
 }
+
+internal data class LoadedConfig(
+    val master: Boolean,
+    val intervalSec: Int,
+    val bootDelaySec: Int,
+    val retention: Int,
+    val token: String,
+    val apps: List<GuardedApp>,
+    val a11y: Set<String>,
+)

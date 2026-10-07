@@ -145,7 +145,7 @@ internal fun SettingsScreen(
         }
         SectionLabel("操作")
         SoftCard {
-            ActionRow("重启守护进程", Blue, chevron = true, onClick = onRestart)
+            ActionRow("立即巡检", Blue, chevron = true, onClick = onRestart)
             Box(Modifier.fillMaxWidth().height(1.dp).background(PageBg))
             ActionRow("清空日志", Red, chevron = false, onClick = onClear)
         }

@@ -3,8 +3,6 @@ package com.minedie.keepalive.core
 data class PatrolInput(
     val masterEnabled: Boolean,
     val bootReady: Boolean,
-    val daemonAlive: Boolean,
-    val daemonStartedBefore: Boolean,
     val apps: List<GuardedApp>,
     val alivePackages: Set<String>,
     val memory: Map<String, AppMemory>,
@@ -18,9 +16,6 @@ data class PatrolInput(
 data class PatrolOutput(
     val phase: Phase,
     val events: List<EventDraft>,
-    val startDaemon: Boolean,
-    val markDaemonStarted: Boolean,
-    val stopDaemon: Boolean,
     val startComponents: List<GuardedApp>,
     val a11yValue: String?,
     val a11yAdded: List<String>,
@@ -28,15 +23,17 @@ data class PatrolOutput(
     val resetAdj: Boolean,
 )
 
+/**
+ * Patrol uses only data the system process already holds. It must not ask whether
+ * this module's process is alive: ColorOS freezes that uid when the UI is closed,
+ * and a binder call into it stalls the patrol before any guarded service starts.
+ */
 object PatrolPolicy {
     fun decide(input: PatrolInput): PatrolOutput {
         if (!input.masterEnabled) {
             return PatrolOutput(
                 phase = Phase.PAUSED,
                 events = emptyList(),
-                startDaemon = false,
-                markDaemonStarted = input.daemonStartedBefore,
-                stopDaemon = input.daemonAlive,
                 startComponents = emptyList(),
                 a11yValue = null,
                 a11yAdded = emptyList(),
@@ -48,9 +45,6 @@ object PatrolPolicy {
             return PatrolOutput(
                 phase = Phase.WAITING_BOOT,
                 events = emptyList(),
-                startDaemon = false,
-                markDaemonStarted = input.daemonStartedBefore,
-                stopDaemon = false,
                 startComponents = emptyList(),
                 a11yValue = null,
                 a11yAdded = emptyList(),
@@ -62,10 +56,6 @@ object PatrolPolicy {
         val events = mutableListOf<EventDraft>()
         val starts = mutableListOf<GuardedApp>()
         val nextMemory = linkedMapOf<String, AppMemory>()
-        val startDaemon = !input.daemonAlive
-        if (startDaemon) {
-            events += if (input.daemonStartedBefore) EventText.pulled() else EventText.daemonStarted()
-        }
 
         for (app in input.apps) {
             if (app.packageName.isBlank() || !app.enabled) continue
@@ -164,11 +154,8 @@ object PatrolPolicy {
 
         val merge = A11yList.merge(input.enabledA11yRaw, input.guardedA11y)
         return PatrolOutput(
-            phase = if (input.daemonAlive) Phase.RUNNING else Phase.PULLING,
+            phase = Phase.RUNNING,
             events = events,
-            startDaemon = startDaemon,
-            markDaemonStarted = input.daemonStartedBefore || input.daemonAlive || startDaemon,
-            stopDaemon = false,
             startComponents = starts,
             a11yValue = if (merge.changed) merge.value else null,
             a11yAdded = if (merge.changed) merge.added else emptyList(),

@@ -1,5 +1,6 @@
 package com.minedie.keepalive.hook
 
+import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -7,32 +8,36 @@ import android.content.IntentFilter
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.os.UserManager
 import android.provider.Settings
 import com.minedie.keepalive.ACTION_CONTROL
-import com.minedie.keepalive.CONFIG_AUTHORITY
-import com.minedie.keepalive.DAEMON_CLASS
-import com.minedie.keepalive.DAEMON_PROCESS
 import com.minedie.keepalive.APP_PACKAGE
+import com.minedie.keepalive.CONTROL_PERMISSION
+import com.minedie.keepalive.config.ConfigCodec
 import com.minedie.keepalive.config.LoadedConfig
-import com.minedie.keepalive.config.toLoadedConfig
 import com.minedie.keepalive.core.AppMemory
 import com.minedie.keepalive.core.EventDraft
 import com.minedie.keepalive.core.EventText
-import com.minedie.keepalive.core.EventType
 import com.minedie.keepalive.core.GuardedApp
+import com.minedie.keepalive.core.PatrolInput
 import com.minedie.keepalive.core.PatrolPolicy
-import com.minedie.keepalive.core.Phase
 import com.minedie.keepalive.core.StartupAllow
 import com.minedie.keepalive.core.isPackageAlive
 import com.minedie.keepalive.data.Report
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
-import java.util.ArrayDeque
+import java.io.File
 import java.util.concurrent.ConcurrentLinkedQueue
 
+/**
+ * Patrol runs entirely inside system_server. LSPosed injects this hook at boot.
+ * The saved config is a file this process writes under /data/system, so a reboot
+ * can read it without starting the app. ColorOS freezes this app's uid while the
+ * UI is gone, and a binder call into that uid would stall the patrol, so the tick
+ * never calls back.
+ */
 internal object Watchdog {
     @Volatile var bootCompleted: Boolean = false
     @Volatile var cached: LoadedConfig? = null
@@ -42,16 +47,17 @@ internal object Watchdog {
     private var classLoader: ClassLoader? = null
     private var bootElapsed: Long = 0
     private var started = false
-    private var daemonStartedBefore = false
     private var memory: Map<String, AppMemory> = emptyMap()
     private var components: Map<String, String> = emptyMap()
     private val touched = mutableSetOf<String>()
     private val adjLogged = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val pendingEvents = ConcurrentLinkedQueue<EventDraft>()
-    private val pulls = ArrayDeque<Long>()
-    private var hookError: String? = null
+    @Volatile private var hookError: String? = null
+    private var latest: Report? = null
     private var defaultAdj = 1001
     private var appContext: Context? = null
+    private var reportedConfig = false
+    private val systemConfigFile = File("/data/system/$APP_PACKAGE/config.json")
 
     private val runnable = Runnable { tick() }
 
@@ -73,14 +79,18 @@ internal object Watchdog {
         }
         classLoader = loader
         defaultAdj = Adj.readDefault(loader)
+        appContext = context
+        cached = loadConfig()
         bootCompleted = true
         bootElapsed = SystemClock.elapsedRealtime()
-        appContext = context
-        handler = Handler(Looper.getMainLooper())
-        registerControl(context)
+        val thread = HandlerThread("heshang-patrol")
+        thread.start()
+        val watchHandler = Handler(thread.looper)
+        handler = watchHandler
+        registerControl(context, watchHandler)
         started = true
         KLog.i("watchdog started")
-        handler?.post(runnable)
+        watchHandler.post(runnable)
     }
 
     fun noteAdj(packageName: String, label: String) {
@@ -107,57 +117,91 @@ internal object Watchdog {
         }
     }
 
-    private fun registerControl(context: Context) {
+    private fun registerControl(context: Context, watchHandler: Handler) {
         val filter = IntentFilter(ACTION_CONTROL)
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                val config = cached ?: loadConfig(ctx) ?: return
-                if (intent.getStringExtra("token") != config.token) return
+                if (!sentByApp(this)) return
                 when (intent.getStringExtra("op")) {
-                    "restart" -> restart()
-                    "rescan" -> {
-                        memory = PatrolPolicy.resetGiveUps(memory)
-                        handler?.removeCallbacks(runnable)
-                        handler?.post(runnable)
-                    }
+                    "pull" -> reply(this, ctx, intent)
                     "retry" -> {
+                        if (!accept(ctx, intent)) return
                         val pkg = intent.getStringExtra("package")
-                        if (!pkg.isNullOrEmpty()) {
-                            memory = PatrolPolicy.retry(memory, pkg)
-                            handler?.removeCallbacks(runnable)
-                            handler?.post(runnable)
-                        }
+                        if (!pkg.isNullOrEmpty()) memory = PatrolPolicy.retry(memory, pkg)
+                        tick()
+                    }
+                    "rescan", "restart" -> {
+                        if (!accept(ctx, intent)) return
+                        memory = PatrolPolicy.resetGiveUps(memory)
+                        tick()
+                    }
+                    else -> {
+                        if (!accept(ctx, intent)) return
+                        watchHandler.removeCallbacks(runnable)
+                        watchHandler.post(runnable)
                     }
                 }
             }
         }
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            context.registerReceiver(receiver, filter)
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(
+                    receiver,
+                    filter,
+                    CONTROL_PERMISSION,
+                    watchHandler,
+                    Context.RECEIVER_EXPORTED,
+                )
+            } else {
+                context.registerReceiver(receiver, filter, CONTROL_PERMISSION, watchHandler)
+            }
+            KLog.i("control receiver registered in ${context.packageName}")
+        } catch (error: Throwable) {
+            noteHookError("控制通道注册失败: ${error.javaClass.simpleName}")
         }
     }
 
-    private fun restart() {
-        val pid = daemonPid(ProcessTable.read(ams ?: return))
-        if (pid > 0) {
-            try {
-                android.os.Process.killProcess(pid)
-            } catch (error: Throwable) {
-                KLog.i("kill daemon failed: ${error.javaClass.simpleName}")
-            }
+    private fun sentByApp(receiver: BroadcastReceiver): Boolean {
+        if (Build.VERSION.SDK_INT < 34) return true
+        val pkg = receiver.sentFromPackage ?: return true
+        return pkg == APP_PACKAGE
+    }
+
+    /** The app is the source of truth while it is running. A new token means its data was reset. */
+    private fun accept(context: Context, intent: Intent): Boolean {
+        val incoming = ConfigCodec.configFromJson(intent.getStringExtra("config"))
+        if (incoming != null) {
+            if (intent.getStringExtra("token") != incoming.token) return false
+            cached = incoming
+            writeSystemConfig(incoming)
+            return true
         }
-        daemonStartedBefore = true
-        handler?.removeCallbacks(runnable)
-        handler?.postDelayed(runnable, 500)
-        KLog.i("restart requested")
+        val known = cached ?: loadConfig() ?: return false
+        if (known.token.isBlank() || intent.getStringExtra("token") != known.token) return false
+        cached = known
+        return true
+    }
+
+    private fun reply(receiver: BroadcastReceiver, context: Context, intent: Intent) {
+        try {
+            if (!accept(context, intent)) return
+            val report = latest
+            if (report == null) {
+                handler?.removeCallbacks(runnable)
+                handler?.post(runnable)
+                return
+            }
+            receiver.setResult(Activity.RESULT_OK, null, report.copy(events = drainEvents()).toBundle())
+        } catch (error: Throwable) {
+            noteHookError("回传状态失败: ${error.javaClass.simpleName}")
+        }
     }
 
     private fun tick() {
         val context = appContext ?: return
         val ams = ams ?: return
         try {
-            val config = loadConfig(context)
+            val config = loadConfig()
             if (config == null) {
                 KLog.i("config unavailable")
                 schedule(20)
@@ -167,11 +211,10 @@ internal object Watchdog {
             syncComponents(config.apps)
             val delayElapsed = SystemClock.elapsedRealtime() - bootElapsed >= config.bootDelaySec * 1000L
             val bootReady = delayElapsed && isUserUnlocked(context)
+            val enabled = config.apps.filter { it.enabled }
             val rows = ProcessTable.read(ams)
             val names = rows.map { it.processName }.toSet()
-            val enabled = config.apps.filter { it.enabled }
             val alive = enabled.map { it.packageName }.filter { isPackageAlive(names, it) }.toSet()
-            val daemonPid = daemonPid(rows)
             val table = ServiceTable.read(ams)
             val runningServices = if (table.trusted) {
                 table.services.map { "${it.packageName}/${it.className}" }.toSet()
@@ -179,11 +222,9 @@ internal object Watchdog {
                 null
             }
             val decision = PatrolPolicy.decide(
-                com.minedie.keepalive.core.PatrolInput(
+                PatrolInput(
                     masterEnabled = config.master,
                     bootReady = bootReady,
-                    daemonAlive = daemonPid > 0,
-                    daemonStartedBefore = daemonStartedBefore,
                     apps = enabled,
                     alivePackages = alive,
                     memory = memory,
@@ -193,7 +234,6 @@ internal object Watchdog {
                 ),
             )
             memory = decision.memory
-            if (decision.markDaemonStarted) daemonStartedBefore = true
             if (bootCompleted) {
                 applyAdj(ams, rows, enabled, decision.resetAdj, config.master)
             }
@@ -222,32 +262,41 @@ internal object Watchdog {
                     events += serviceEvent
                 }
             }
-            while (true) {
-                val extra = pendingEvents.poll() ?: break
-                events += extra
-            }
-            recordPulls(events)
+            enqueue(events, config.retention)
             val enabledPackages = enabled.map { it.packageName }.toSet()
-            val report = Report(
+            latest = Report(
                 phase = decision.phase,
-                daemonPid = if (decision.stopDaemon) 0 else daemonPid,
+                daemonPid = 0,
                 runningPackages = alive.toList(),
-                pullsLastHour = pulls.size,
+                pullsLastHour = 0,
                 hookError = hookError,
-                events = events,
+                events = emptyList(),
                 retention = config.retention,
-                stop = decision.stopDaemon,
+                stop = false,
                 gaveUpPackages = memory.filter { (pkg, item) -> item.gaveUp && pkg in enabledPackages }.keys.toList(),
-                runningServices = com.minedie.keepalive.config.ConfigCodec.servicesToJson(
+                runningServices = ConfigCodec.servicesToJson(
                     table.services.map { Triple(it.packageName, it.className, it.processName) },
                 ),
             )
-            deliver(context, config, report)
             schedule(config.intervalSec)
         } catch (error: Throwable) {
             noteHookError("巡检失败: ${error.javaClass.simpleName}")
             schedule(20)
         }
+    }
+
+    private fun enqueue(events: List<EventDraft>, cap: Int) {
+        for (event in events) pendingEvents.add(event)
+        val limit = cap.coerceAtLeast(1)
+        while (pendingEvents.size > limit) pendingEvents.poll()
+    }
+
+    private fun drainEvents(): List<EventDraft> {
+        val out = ArrayList<EventDraft>()
+        while (true) {
+            out += pendingEvents.poll() ?: break
+        }
+        return out
     }
 
     private fun syncComponents(apps: List<GuardedApp>) {
@@ -272,7 +321,7 @@ internal object Watchdog {
             synchronized(ams) {
                 for (row in rows) {
                     val pkg = row.processName.substringBefore(':')
-                    val keep = !reset && master && (pkg in protected || row.processName == DAEMON_PROCESS)
+                    val keep = !reset && master && pkg in protected
                     try {
                         if (keep) {
                             Adj.setMax(row.record, Adj.PERCEPTIBLE)
@@ -293,43 +342,56 @@ internal object Watchdog {
         }
     }
 
-    private fun deliver(context: Context, config: LoadedConfig, report: Report) {
-        // ColorOS freezes the app uid, including :daemon. The provider call runs from
-        // system_server and is what actually gets the event log written while frozen.
-        val wrote = writeReport(context, report)
-        val useDaemon = (config.master && report.phase != Phase.WAITING_BOOT) || report.stop
-        if (!useDaemon) return
-        val intent = Intent().setClassName(APP_PACKAGE, DAEMON_CLASS)
-        intent.putExtra("token", config.token)
-        if (wrote) {
-            intent.putExtra("op", if (report.stop) "stop" else "hold")
-        } else {
-            intent.putExtra("op", "report")
-            intent.putExtras(report.toBundle())
+    /**
+     * system_server owns this file. The app json is mode 600 and not readable here.
+     * A push from the app writes it; every later boot reads it without starting the app.
+     */
+    private fun loadConfig(): LoadedConfig? {
+        val fresh = readSystemConfig()
+        if (fresh != null) {
+            cached = fresh
+            return fresh
         }
-        try {
-            context.startService(intent)
-        } catch (error: Throwable) {
-            noteHookError("启动守护进程失败: ${error.javaClass.simpleName}")
-        }
+        return cached
     }
 
-    private fun writeReport(context: Context, report: Report): Boolean {
+    private fun readSystemConfig(): LoadedConfig? {
         return try {
-            context.contentResolver.call(CONFIG_AUTHORITY, "report", null, report.toBundle()) != null
+            if (!systemConfigFile.isFile) {
+                if (!reportedConfig) {
+                    KLog.i("system config missing ${systemConfigFile.absolutePath}")
+                    reportedConfig = true
+                }
+                return null
+            }
+            val loaded = ConfigCodec.configFromJson(systemConfigFile.readText())
+            if (!reportedConfig) {
+                KLog.i("system config read ${systemConfigFile.absolutePath} ok=${loaded != null}")
+                reportedConfig = true
+            }
+            loaded
         } catch (error: Throwable) {
-            KLog.i("provider report failed: ${error.javaClass.simpleName}")
-            false
-        }
-    }
-
-    private fun loadConfig(context: Context): LoadedConfig? {
-        return try {
-            val bundle = context.contentResolver.call(CONFIG_AUTHORITY, "load", null, null) ?: return null
-            bundle.toLoadedConfig()
-        } catch (error: Throwable) {
-            KLog.i("load config failed: ${error.javaClass.simpleName}")
+            KLog.i("system config read failed: ${error.javaClass.simpleName} ${error.message}")
             null
+        }
+    }
+
+    private fun writeSystemConfig(config: LoadedConfig) {
+        try {
+            val directory = systemConfigFile.parentFile ?: return
+            if (!directory.exists() && !directory.mkdirs()) {
+                KLog.i("system config directory missing ${directory.absolutePath}")
+                return
+            }
+            val temporary = File(directory, "${systemConfigFile.name}.tmp")
+            temporary.writeText(ConfigCodec.configToJson(config))
+            if (!temporary.renameTo(systemConfigFile)) {
+                systemConfigFile.writeText(ConfigCodec.configToJson(config))
+                temporary.delete()
+            }
+            KLog.i("system config stored ${systemConfigFile.absolutePath}")
+        } catch (error: Throwable) {
+            KLog.i("system config write failed: ${error.javaClass.simpleName} ${error.message}")
         }
     }
 
@@ -368,6 +430,7 @@ internal object Watchdog {
     /** Null means the service was started. A short reason means it was refused. */
     private fun startComponent(context: Context, flat: String): String? {
         val component = android.content.ComponentName.unflattenFromString(flat) ?: return "组件无效"
+        if (component.packageName == APP_PACKAGE) return "不拉起本模块"
         val identity = Binder.clearCallingIdentity()
         try {
             val info = context.packageManager.getServiceInfo(component, 0)
@@ -428,19 +491,6 @@ internal object Watchdog {
         val name = root.javaClass.simpleName.ifBlank { "未能启动" }
         KLog.i("silent start refused: $name")
         return name
-    }
-
-    private fun recordPulls(events: List<EventDraft>) {
-        val now = System.currentTimeMillis()
-        if (events.any { it.type == EventType.WATCHDOG_PULLED_DAEMON }) {
-            pulls.addLast(now)
-        }
-        val hour = 60 * 60 * 1000L
-        while (pulls.isNotEmpty() && now - pulls.first() > hour) pulls.removeFirst()
-    }
-
-    private fun daemonPid(rows: List<ProcessRow>): Int {
-        return rows.firstOrNull { it.processName == DAEMON_PROCESS }?.pid ?: 0
     }
 
     private fun schedule(seconds: Int) {

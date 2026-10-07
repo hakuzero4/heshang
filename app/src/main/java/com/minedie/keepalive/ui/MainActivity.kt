@@ -1,6 +1,5 @@
 package com.minedie.keepalive.ui
 
-import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -49,8 +48,6 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.light(PageBg.toArgb(), PageBg.toArgb()),
             navigationBarStyle = SystemBarStyle.light(Color.White.toArgb(), Color.White.toArgb()),
         )
-        val permissions = startupPermissions()
-        if (permissions.isNotEmpty()) requestPermissions(permissions, 1)
         setContent {
             val state by model.state.collectAsStateWithLifecycle()
             var tab by remember { mutableStateOf(Tab.Overview) }
@@ -150,7 +147,7 @@ class MainActivity : ComponentActivity() {
                                 model::setInterval,
                                 model::setBootDelay,
                                 model::setRetention,
-                                model::restartDaemon,
+                                model::patrolNow,
                                 model::clearLogs,
                             )
                         }
@@ -200,16 +197,6 @@ class MainActivity : ComponentActivity() {
         }
         askedApps = true
         requestPermissions(arrayOf(GET_INSTALLED_APPS), 1)
-    }
-
-    private fun startupPermissions(): Array<String> {
-        val names = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            names += Manifest.permission.POST_NOTIFICATIONS
-        }
-        return names.toTypedArray()
     }
 
     private fun installedAppsPermissionKnown(): Boolean {

@@ -12,12 +12,11 @@ class KeepAliveCoreTest {
     @Test
     fun masterOffKeepsConfigAndEmitsNothing() {
         val out = PatrolPolicy.decide(
-            base(master = false, daemonAlive = true, memory = mapOf(scene.packageName to AppMemory(wasAlive = true))),
+            base(master = false, memory = mapOf(scene.packageName to AppMemory(wasAlive = true))),
         )
         assertEquals(Phase.PAUSED, out.phase)
         assertTrue(out.events.isEmpty())
         assertTrue(out.resetAdj)
-        assertTrue(out.stopDaemon)
         assertTrue(out.memory.isEmpty())
         assertTrue(out.startComponents.isEmpty())
     }
@@ -28,7 +27,6 @@ class KeepAliveCoreTest {
         val out = PatrolPolicy.decide(base(bootReady = false, memory = memory, alive = emptySet()))
         assertEquals(Phase.WAITING_BOOT, out.phase)
         assertTrue(out.events.isEmpty())
-        assertFalse(out.startDaemon)
         assertEquals(memory, out.memory)
     }
 
@@ -132,15 +130,12 @@ class KeepAliveCoreTest {
     }
 
     @Test
-    fun daemonStartThenPull() {
-        val first = PatrolPolicy.decide(base(daemonAlive = false, daemonStartedBefore = false))
-        assertEquals(EventType.DAEMON_STARTED, first.events.single { it.type == EventType.DAEMON_STARTED }.type)
-        assertTrue(first.startDaemon)
-        assertEquals(Phase.PULLING, first.phase)
-
-        val later = PatrolPolicy.decide(base(daemonAlive = false, daemonStartedBefore = true, alive = setOf(scene.packageName)))
-        assertEquals(EventType.WATCHDOG_PULLED_DAEMON, later.events.single().type)
-        assertEquals("已拉起守护进程", later.events.single().detail)
+    fun runningPhaseDoesNotDependOnThisApp() {
+        val out = PatrolPolicy.decide(base(alive = setOf(scene.packageName)))
+        assertEquals(Phase.RUNNING, out.phase)
+        assertTrue(out.events.none {
+            it.type == EventType.DAEMON_STARTED || it.type == EventType.WATCHDOG_PULLED_DAEMON
+        })
     }
 
     @Test
@@ -160,50 +155,45 @@ class KeepAliveCoreTest {
     @Test
     fun statusFollowsTheOverviewTable() {
         val running = StatusMachine.derive(
-            StatusInput(true, true, Phase.RUNNING, 1_000, 20_000, 14891, 0),
+            StatusInput(true, true, Phase.RUNNING, 1_000, 20_000),
         )
         assertEquals("守护运行中", running.title)
+        assertEquals("巡检正常", running.subtitle)
         assertTrue(running.healthy)
-        assertTrue(running.subtitle.contains("14891"))
 
         assertEquals(
             "模块未激活",
-            StatusMachine.derive(StatusInput(false, true, Phase.RUNNING, 0, 20_000, 1, 0)).title,
+            StatusMachine.derive(StatusInput(false, true, Phase.RUNNING, 0, 20_000)).title,
         )
         assertEquals(
             "守护已暂停",
-            StatusMachine.derive(StatusInput(true, false, Phase.RUNNING, 0, 20_000, 1, 0)).title,
+            StatusMachine.derive(StatusInput(true, false, Phase.RUNNING, 0, 20_000)).title,
         )
         assertEquals(
             "等待开机延迟",
-            StatusMachine.derive(StatusInput(true, true, Phase.WAITING_BOOT, 0, 20_000, 0, 0)).title,
+            StatusMachine.derive(StatusInput(true, true, Phase.WAITING_BOOT, 0, 20_000)).title,
         )
         assertEquals(
             "看门狗未就绪",
-            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, null, 20_000, 1, 0)).title,
+            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, null, 20_000)).title,
         )
         assertEquals(
             "守护运行中",
-            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 40_001, 20_000, 1, 0)).title,
+            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 40_001, 20_000)).title,
         )
         assertEquals(
             "看门狗异常",
-            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 90_001, 20_000, 1, 0)).title,
+            StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 90_001, 20_000)).title,
         )
         val opening = StatusMachine.derive(
-            StatusInput(true, true, Phase.RUNNING, 180_000, 5_000, 0, 0, awaitingHeartbeat = true),
+            StatusInput(true, true, Phase.RUNNING, 180_000, 5_000, awaitingHeartbeat = true),
         )
         assertEquals("守护运行中", opening.title)
         assertTrue(opening.healthy)
-        val pulling = StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000, 0, 0))
-        assertEquals("守护运行中", pulling.title)
-        assertEquals("巡检正常", pulling.subtitle)
-        assertTrue(pulling.healthy)
-        val stuck = StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000, 0, 6))
-        assertEquals("看门狗正在拉起守护进程", stuck.title)
-        assertEquals(StatusMachine.PULL_WARNING, stuck.warning)
-        val warned = StatusMachine.derive(StatusInput(true, true, Phase.RUNNING, 1_000, 20_000, 4, 6))
-        assertEquals(StatusMachine.PULL_WARNING, warned.warning)
+        val legacy = StatusMachine.derive(StatusInput(true, true, Phase.PULLING, 1_000, 20_000))
+        assertEquals("守护运行中", legacy.title)
+        assertEquals("巡检正常", legacy.subtitle)
+        assertTrue(legacy.healthy)
     }
 
     @Test
@@ -471,8 +461,6 @@ class KeepAliveCoreTest {
     private fun base(
         master: Boolean = true,
         bootReady: Boolean = true,
-        daemonAlive: Boolean = true,
-        daemonStartedBefore: Boolean = true,
         apps: List<GuardedApp> = listOf(scene),
         alive: Set<String> = setOf(scene.packageName),
         memory: Map<String, AppMemory> = emptyMap(),
@@ -482,8 +470,6 @@ class KeepAliveCoreTest {
     ) = PatrolInput(
         masterEnabled = master,
         bootReady = bootReady,
-        daemonAlive = daemonAlive,
-        daemonStartedBefore = daemonStartedBefore,
         apps = apps,
         alivePackages = alive,
         memory = memory,

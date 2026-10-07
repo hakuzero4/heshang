@@ -122,10 +122,9 @@ class FrameworkHook : IXposedHookLoadPackage {
                 if (!config.master) return
                 val processName = XposedHelpers.getObjectField(record, "processName") as? String ?: return
                 val pkg = processName.substringBefore(':')
-                val guarded = config.apps.firstOrNull { it.enabled && it.packageName == pkg }
-                if (guarded == null && processName != com.minedie.keepalive.DAEMON_PROCESS) return
+                val guarded = config.apps.firstOrNull { it.enabled && it.packageName == pkg } ?: return
                 Adj.setMax(record, Adj.PERCEPTIBLE)
-                if (guarded != null) Watchdog.noteAdj(guarded.packageName, guarded.label)
+                Watchdog.noteAdj(guarded.packageName, guarded.label)
             } catch (error: Throwable) {
                 Watchdog.noteHookError("新建进程 adj 失败: ${error.javaClass.simpleName}")
             }

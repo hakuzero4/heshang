@@ -25,7 +25,8 @@ internal data class StoredConfig(
  * so the watchdog config lives in the app files directory instead.
  */
 internal class ConfigStore(context: Context) {
-    private val file = File(context.applicationContext.filesDir, "$PREFS_NAME.json")
+    private val appContext = context.applicationContext
+    private val file = File(appContext.filesDir, "$PREFS_NAME.json")
 
     fun ensureToken(): String = load().token
 

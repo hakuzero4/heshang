@@ -17,15 +17,24 @@ internal object ControlBus {
         context.sendBroadcast(intent(context, op, packageName))
     }
 
-    fun pull(context: Context, onReport: (Report) -> Unit) {
+    fun pull(context: Context, onResult: (Report?, LoadedConfig?) -> Unit) {
         context.sendOrderedBroadcast(
-            intent(context, "pull", null),
+            pullIntent(context),
             null,
             object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, data: Intent) {
-                    if (resultCode != Activity.RESULT_OK) return
-                    val extras = getResultExtras(false) ?: return
-                    onReport(Report.fromBundle(extras))
+                    if (resultCode != Activity.RESULT_OK) {
+                        onResult(null, null)
+                        return
+                    }
+                    val extras = getResultExtras(false)
+                    if (extras == null) {
+                        onResult(null, null)
+                        return
+                    }
+                    val report = if (extras.containsKey("phase")) Report.fromBundle(extras) else null
+                    val config = ConfigCodec.configFromJson(extras.getString("config"))
+                    onResult(report, config)
                 }
             },
             null,
@@ -33,6 +42,13 @@ internal object ControlBus {
             null,
             null,
         )
+    }
+
+    private fun pullIntent(context: Context): Intent {
+        return Intent(ACTION_CONTROL)
+            .setPackage("android")
+            .putExtra("op", "pull")
+            .putExtra("token", ConfigStore(context).peekToken())
     }
 
     private fun intent(context: Context, op: String, packageName: String?): Intent {

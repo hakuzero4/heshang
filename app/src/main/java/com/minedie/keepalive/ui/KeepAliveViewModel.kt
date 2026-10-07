@@ -338,9 +338,10 @@ class KeepAliveViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun pull() {
         val app = getApplication<Application>()
-        ControlBus.pull(app) { report ->
+        ControlBus.pull(app) { report, remote ->
             viewModelScope.launch(Dispatchers.IO) {
-                ReportWriter.write(app, report)
+                if (remote != null && store.shouldAdopt(remote)) store.adopt(remote)
+                if (report != null) ReportWriter.write(app, report)
                 refresh()
             }
         }

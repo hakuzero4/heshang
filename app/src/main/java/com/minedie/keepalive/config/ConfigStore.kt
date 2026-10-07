@@ -30,6 +30,41 @@ internal class ConfigStore(context: Context) {
 
     fun ensureToken(): String = load().token
 
+    fun hasFile(): Boolean = file.exists()
+
+    /** No master switch and no saved apps. A reinstall looks like this. */
+    fun isBlank(): Boolean {
+        if (!file.exists()) return true
+        val config = decode(read())
+        return !config.master && config.apps.isEmpty() && config.a11y.isEmpty()
+    }
+
+    fun shouldAdopt(remote: LoadedConfig): Boolean {
+        if (!isBlank()) return false
+        return remote.master || remote.apps.isNotEmpty() || remote.a11y.isNotEmpty()
+    }
+
+    /** Copy the system process file into this app. Keeps the local show-system flag. */
+    @Synchronized
+    fun adopt(config: LoadedConfig) {
+        val showSystem = read().optBoolean(KEY_SYSTEM, false)
+        val json = JSONObject()
+            .put(KEY_MASTER, config.master)
+            .put(KEY_INTERVAL, config.intervalSec)
+            .put(KEY_BOOT, config.bootDelaySec)
+            .put(KEY_RETENTION, config.retention)
+            .put(KEY_TOKEN, config.token)
+            .put(KEY_APPS, ConfigCodec.appsToJson(config.apps))
+            .put(KEY_A11Y, ConfigCodec.stringsToJson(config.a11y))
+            .put(KEY_SYSTEM, showSystem)
+        write(json)
+    }
+
+    fun peekToken(): String {
+        if (!file.exists()) return ""
+        return read().optString(KEY_TOKEN)
+    }
+
     @Synchronized
     fun load(): StoredConfig {
         val json = read()

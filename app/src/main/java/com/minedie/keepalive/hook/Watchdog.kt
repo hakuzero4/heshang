@@ -123,7 +123,7 @@ internal object Watchdog {
             override fun onReceive(ctx: Context, intent: Intent) {
                 if (!sentByApp(this)) return
                 when (intent.getStringExtra("op")) {
-                    "pull" -> reply(this, ctx, intent)
+                    "pull" -> reply(this)
                     "retry" -> {
                         if (!accept(ctx, intent)) return
                         val pkg = intent.getStringExtra("package")
@@ -167,7 +167,7 @@ internal object Watchdog {
         return pkg == APP_PACKAGE
     }
 
-    /** The app is the source of truth while it is running. A new token means its data was reset. */
+    /** A push carries the app's copy. Pull must not write; the app adopts this file when its own is empty. */
     private fun accept(context: Context, intent: Intent): Boolean {
         val incoming = ConfigCodec.configFromJson(intent.getStringExtra("config"))
         if (incoming != null) {
@@ -182,16 +182,12 @@ internal object Watchdog {
         return true
     }
 
-    private fun reply(receiver: BroadcastReceiver, context: Context, intent: Intent) {
+    private fun reply(receiver: BroadcastReceiver) {
         try {
-            if (!accept(context, intent)) return
-            val report = latest
-            if (report == null) {
-                handler?.removeCallbacks(runnable)
-                handler?.post(runnable)
-                return
-            }
-            receiver.setResult(Activity.RESULT_OK, null, report.copy(events = drainEvents()).toBundle())
+            val bundle = latest?.copy(events = drainEvents())?.toBundle() ?: android.os.Bundle()
+            val config = loadConfig()
+            if (config != null) bundle.putString("config", ConfigCodec.configToJson(config))
+            receiver.setResult(Activity.RESULT_OK, null, bundle)
         } catch (error: Throwable) {
             noteHookError("回传状态失败: ${error.javaClass.simpleName}")
         }
